@@ -186,8 +186,7 @@ async function run(file) {
       await zip.close(); streams.delete(wbStream);
       await outer.add(`LGP_Console_${g.name}.xlsx`, new BlobReader(await wbHandle.getFile()), { level: 0 });
       reconciled += g.rows;
-      await dir.removeEntry(`workbook_${i}.xlsx`);
-      i++;
+
       notify('Generating workbooks', `Created ${i} of ${groups.size}`, 67 + Math.round(i / groups.size * 32));
     }
     await outer.close(); streams.delete(outerStream);
