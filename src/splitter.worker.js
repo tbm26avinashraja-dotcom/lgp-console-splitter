@@ -1,16 +1,38 @@
 
 import {
   ZipReader,
-  ZipReaderStream,
-  ZipWriterStream,
+  ZipWriter,
   BlobReader,
-  TextWriter
+  TextReader,
+  TextWriter,
+  Writer
 } from '@zip.js/zip.js';
+
+class WritableStreamWriter extends Writer {
+  constructor(stream) {
+    super();
+    this.writer = stream.getWriter();
+    this.closed = false;
+  }
+
+  async writeUint8Array(array) {
+    if (this.closed) {
+      throw new Error('Cannot write to a closed stream.');
+    }
+    await this.writer.write(array);
+  }
+
+  async close() {
+    if (this.closed) return;
+    await this.writer.close();
+    this.closed = true;
+    this.writer.releaseLock();
+  }
+}
 
 const XML_HEAD =
   '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
-  '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">' +
-  '<sheetData>';
+  '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>';
 
 const XML_END = '</sheetData></worksheet>';
 
@@ -44,16 +66,9 @@ const STATIC = {
     '</Relationships>'
 };
 
-const encoder = new TextEncoder();
-
-function notify(label, detail, percent) {
-  self.postMessage({
-    type: 'progress',
-    label,
-    detail,
-    percent
-  });
-}
+const notify = (label, detail, percent) => {
+  self.postMessage({ type: 'progress', label, detail, percent });
+};
 
 function decodeXml(value) {
   return String(value ?? '')
@@ -97,23 +112,19 @@ function safeName(value) {
 
 function columnIndex(letters) {
   let result = 0;
-
   for (const char of letters) {
     result = result * 26 + char.charCodeAt(0) - 64;
   }
-
   return result - 1;
 }
 
 function cellParts(row) {
   const cells = [];
   const regex = /<c\b([^>]*?)(?:\s*\/>|>([\s\S]*?)<\/c\s*>)/g;
-
   let match;
 
   while ((match = regex.exec(row))) {
     const reference = /\br="([A-Z]+)(\d+)"/.exec(match[1]);
-
     if (reference) {
       cells.push({
         index: columnIndex(reference[1]),
@@ -123,7 +134,6 @@ function cellParts(row) {
       });
     }
   }
-
   return cells;
 }
 
@@ -133,7 +143,6 @@ function extractCell(cell, sharedStrings) {
 
   if (type === 's') {
     const index = Number(raw);
-
     if (
       !Number.isInteger(index) ||
       index < 0 ||
@@ -141,16 +150,13 @@ function extractCell(cell, sharedStrings) {
     ) {
       throw new Error(`Invalid shared string index: ${raw}`);
     }
-
     return sharedStrings[index];
   }
 
   if (type === 'inlineStr') {
     return [...cell.body.matchAll(
       /<t(?:\s[^>]*)?>([\s\S]*?)<\/t>/g
-    )]
-      .map(match => decodeXml(match[1]))
-      .join('');
+    )].map(match => decodeXml(match[1])).join('');
   }
 
   return decodeXml(raw ?? '');
@@ -175,11 +181,8 @@ function cleanRow(row, rowNumber, sharedStrings) {
         `<v>${value === '1' ? '1' : '0'}</v></c>`;
     } else if (value !== '') {
       if (!Number.isFinite(Number(value))) {
-        throw new Error(
-          `Unexpected non-numeric value in ${reference}`
-        );
+        throw new Error(`Unexpected non-numeric value in ${reference}`);
       }
-
       xml +=
         `<c r="${reference}" t="n"><v>${value}</v></c>`;
     }
@@ -197,44 +200,14 @@ function parseSharedStrings(xml) {
     values.push(
       [...item[1].matchAll(
         /<t(?:\s[^>]*)?>([\s\S]*?)<\/t>/g
-      )]
-        .map(match => decodeXml(match[1]))
-        .join('')
+      )].map(match => decodeXml(match[1])).join('')
     );
   }
-
   return values;
 }
 
-async function writeTextEntry(zip, name, text) {
-  const entry = new WritableStream();
-  const writer = entry.getWriter();
-  await writer.write(encoder.encode(text));
-  await writer.close();
-}
-
-async function addZipEntry(zipWriter, name, source) {
-  const entry = new WritableStream();
-  const writer = entry.getWriter();
-
-  // Native zip.js stream API.
-  const zipEntry = new ZipWriterStream({
-    level: 0
-  });
-
-  const sourceStream = source.stream();
-
-  await sourceStream.pipeTo(
-    zipEntry.writable
-  );
-
-  return zipEntry.readable;
-}
-
 async function run(file) {
-  if (!file) {
-    throw new Error('Select an XLSX workbook.');
-  }
+  if (!file) throw new Error('Select an XLSX workbook.');
 
   if (!self.navigator?.storage?.getDirectory) {
     throw new Error(
@@ -243,52 +216,34 @@ async function run(file) {
   }
 
   const root = await self.navigator.storage.getDirectory();
-
   const dirName = `lgp-split-${Date.now()}`;
-
-  const dir = await root.getDirectoryHandle(dirName, {
-    create: true
-  });
-
-  const inputReader = new ZipReader(new BlobReader(file));
+  const dir = await root.getDirectoryHandle(dirName, { create: true });
+  const reader = new ZipReader(new BlobReader(file));
+  const openStreams = new Set();
 
   try {
-    const entries = await inputReader.getEntries();
-
+    const entries = await reader.getEntries();
     const sheet =
-      entries.find(
-        entry => entry.filename === 'xl/worksheets/sheet1.xml'
-      ) ||
-      entries.find(
-        entry => /^xl\/worksheets\/sheet\d+\.xml$/.test(
-          entry.filename
-        )
+      entries.find(e => e.filename === 'xl/worksheets/sheet1.xml') ||
+      entries.find(e =>
+        /^xl\/worksheets\/sheet\d+\.xml$/.test(e.filename)
       );
 
-    if (!sheet) {
-      throw new Error('No worksheet found in this XLSX file.');
-    }
+    if (!sheet) throw new Error('No worksheet found in this XLSX file.');
 
     const sharedEntry = entries.find(
-      entry => entry.filename === 'xl/sharedStrings.xml'
+      e => e.filename === 'xl/sharedStrings.xml'
     );
-
     let sharedStrings = [];
 
     if (sharedEntry) {
-      notify(
-        'Reading shared strings',
-        'Preparing Excel text values',
-        2
-      );
-
+      notify('Reading shared strings', 'Preparing Excel text values', 2);
       const text = await sharedEntry.getData(new TextWriter());
       sharedStrings = parseSharedStrings(text);
     }
 
     const groups = new Map();
     const usedNames = new Set();
-
     let headers = null;
     let partyIndex = -1;
     let headerXml = '';
@@ -297,30 +252,25 @@ async function run(file) {
 
     async function getGroup(party) {
       const key = normalize(party) || '__UNASSIGNED__';
-
-      if (groups.has(key)) {
-        return groups.get(key);
-      }
+      if (groups.has(key)) return groups.get(key);
 
       let name = safeName(
         key === '__UNASSIGNED__' ? 'UNASSIGNED' : key
       );
-
       const base = name;
       let suffix = 2;
 
       while (usedNames.has(name.toLowerCase())) {
         name = `${base.slice(0, 75)}_${suffix++}`;
       }
-
       usedNames.add(name.toLowerCase());
 
       const handle = await dir.getFileHandle(
         `party_${groups.size}.xml`,
         { create: true }
       );
-
       const stream = await handle.createWritable();
+      openStreams.add(stream);
 
       await stream.write(XML_HEAD + headerXml);
 
@@ -332,29 +282,20 @@ async function run(file) {
         rows: 0,
         buffer: ''
       };
-
       groups.set(key, group);
-
       return group;
     }
 
     async function acceptRow(row) {
       if (!headers) {
         headers = [];
-
         for (const cell of cellParts(row)) {
-          headers[cell.index] = extractCell(
-            cell,
-            sharedStrings
-          );
+          headers[cell.index] = extractCell(cell, sharedStrings);
         }
 
         partyIndex = headers.findIndex(
-          header =>
-            normalize(header).replace(/\s+/g, '_') ===
-            'PARTY_NAME'
+          h => normalize(h).replace(/\s+/g, '_') === 'PARTY_NAME'
         );
-
         if (partyIndex < 0) {
           throw new Error(
             'Required column "Party Name" or "party_name" was not found.'
@@ -362,32 +303,22 @@ async function run(file) {
         }
 
         headerXml = cleanRow(row, 1, sharedStrings);
-
         return;
       }
 
       const partyCell = cellParts(row).find(
         cell => cell.index === partyIndex
       );
-
       const party = partyCell
         ? extractCell(partyCell, sharedStrings)
         : '';
 
-      if (!String(party).trim()) {
-        blankParties++;
-      }
+      if (!String(party).trim()) blankParties++;
 
       const group = await getGroup(party);
-
       group.rows++;
       rows++;
-
-      group.buffer += cleanRow(
-        row,
-        group.rows + 1,
-        sharedStrings
-      );
+      group.buffer += cleanRow(row, group.rows + 1, sharedStrings);
 
       if (group.buffer.length >= 256 * 1024) {
         await group.stream.write(group.buffer);
@@ -398,105 +329,70 @@ async function run(file) {
         notify(
           'Grouping transactions',
           `${rows.toLocaleString()} rows, ${groups.size} parties`,
-          Math.min(
-            65,
-            5 + Math.round(rows / 450000 * 60)
-          )
+          Math.min(65, 5 + Math.round(rows / 450000 * 60))
         );
       }
     }
 
-    notify(
-      'Reading workbook',
-      'Streaming worksheet data',
-      4
-    );
+    notify('Reading workbook', 'Streaming worksheet data', 4);
 
     let pending = '';
     let inData = false;
-
     const decoder = new TextDecoder();
 
     async function parseChunk(chunk) {
-      pending += decoder.decode(chunk, {
-        stream: true
-      });
+      pending += decoder.decode(chunk, { stream: true });
 
       if (!inData) {
         const match = /<sheetData(?:\s[^>]*)?>/.exec(pending);
-
         if (!match) {
           if (pending.length > 2_000_000) {
-            throw new Error(
-              'Could not locate worksheet data.'
-            );
+            throw new Error('Could not locate worksheet data.');
           }
-
           return;
         }
-
-        pending = pending.slice(
-          match.index + match[0].length
-        );
-
+        pending = pending.slice(match.index + match[0].length);
         inData = true;
       }
 
       while (true) {
         const start = /<row(?:\s|>)/.exec(pending);
-
         if (!start) {
           pending = pending.slice(-128);
           return;
         }
-
-        if (start.index) {
-          pending = pending.slice(start.index);
-        }
+        if (start.index) pending = pending.slice(start.index);
 
         const end = pending.indexOf('</row>');
-
         if (end < 0) {
           if (pending.length > 20_000_000) {
-            throw new Error(
-              'A worksheet row is unexpectedly large.'
-            );
+            throw new Error('A worksheet row is unexpectedly large.');
           }
-
           return;
         }
 
         const row = pending.slice(0, end + 6);
         pending = pending.slice(end + 6);
-
         await acceptRow(row);
       }
     }
 
-    // Stream worksheet XML from the source ZIP.
-    const sourceStream = new WritableStream({
-      write: parseChunk
-    });
-
-    await sheet.getData({
-      writeUint8Array: async chunk => {
-        await parseChunk(chunk);
-      }
-    });
+    await sheet.getData(
+      new WritableStreamWriter(
+        new WritableStream({ write: parseChunk })
+      )
+    );
 
     if (!headers || rows === 0) {
-      throw new Error(
-        'No transaction rows were found.'
-      );
+      throw new Error('No transaction rows were found.');
     }
 
+    // Finish writing each party's worksheet XML.
     for (const group of groups.values()) {
-      if (group.buffer) {
-        await group.stream.write(group.buffer);
-      }
-
+      if (group.buffer) await group.stream.write(group.buffer);
       await group.stream.write(XML_END);
       await group.stream.close();
+      openStreams.delete(group.stream);
     }
 
     notify(
@@ -505,75 +401,57 @@ async function run(file) {
       67
     );
 
-    // The output ZIP is generated using zip.js streams.
     const zipName = 'LGP_Console_Partywise.zip';
-
     const outputHandle = await dir.getFileHandle(
       zipName,
       { create: true }
     );
+    const outerStream = await outputHandle.createWritable();
+    openStreams.add(outerStream);
 
-    const outputStream = await outputHandle.createWritable();
-
-    const zipStream = new ZipWriterStream({
-      level: 0
-    });
-
-    const zipOutputPromise = zipStream.readable.pipeTo(
-      outputStream
+    const outerZip = new ZipWriter(
+      new WritableStreamWriter(outerStream),
+      { level: 0 }
     );
 
     let generated = 0;
     let reconciledRows = 0;
 
     for (const group of groups.values()) {
-      // Generate a workbook for this Party Name.
       const workbookHandle = await dir.getFileHandle(
         `workbook_${generated}.xlsx`,
         { create: true }
       );
+      const workbookStream = await workbookHandle.createWritable();
+      openStreams.add(workbookStream);
 
-      const workbookOutput =
-        await workbookHandle.createWritable();
-
-      const workbookZip = new ZipWriterStream();
-
-      const workbookPromise =
-        workbookZip.readable.pipeTo(workbookOutput);
-
-      // Add the required XLSX components.
-      for (const [name, xml] of Object.entries(STATIC)) {
-        const entry = new Blob([xml]).stream();
-
-        await entry.pipeTo(
-          workbookZip.writable,
-          { preventClose: true }
-        );
-      }
-
-      const worksheetFile =
-        await group.handle.getFile();
-
-      await worksheetFile.stream().pipeTo(
-        workbookZip.writable,
-        { preventClose: true }
+      const workbookZip = new ZipWriter(
+        new WritableStreamWriter(workbookStream)
       );
 
-      await workbookZip.writable.close();
-      await workbookPromise;
+      for (const [name, xml] of Object.entries(STATIC)) {
+        await workbookZip.add(name, new TextReader(xml));
+      }
 
-      const workbookFile =
-        await workbookHandle.getFile();
+      await workbookZip.add(
+        'xl/worksheets/sheet1.xml',
+        new BlobReader(await group.handle.getFile())
+      );
 
+      await workbookZip.close();
+      openStreams.delete(workbookStream);
+
+      const workbookFile = await workbookHandle.getFile();
       if (workbookFile.size === 0) {
         throw new Error(
           `Generated workbook ${group.name} is empty.`
         );
       }
 
-      await workbookFile.stream().pipeTo(
-        zipStream.writable,
-        { preventClose: true }
+      await outerZip.add(
+        `LGP_Console_${group.name}.xlsx`,
+        new BlobReader(workbookFile),
+        { level: 0 }
       );
 
       reconciledRows += group.rows;
@@ -582,30 +460,45 @@ async function run(file) {
       notify(
         'Generating workbooks',
         `Created ${generated} of ${groups.size}`,
-        67 + Math.round(
-          generated / groups.size * 32
-        )
+        67 + Math.round(generated / groups.size * 32)
       );
     }
 
-    await zipStream.writable.close();
-    await zipOutputPromise;
+    await outerZip.close();
+    openStreams.delete(outerStream);
 
+    // Validate that the ZIP is committed and contains all files.
     const finalZipFile = await outputHandle.getFile();
 
     if (finalZipFile.size === 0) {
-      throw new Error(
-        'ZIP generation failed: output file is empty.'
+      throw new Error('ZIP generation failed: output file is empty.');
+    }
+
+    const verifyReader = new ZipReader(
+      new BlobReader(finalZipFile)
+    );
+
+    try {
+      const zipEntries = await verifyReader.getEntries();
+      const xlsxEntries = zipEntries.filter(
+        entry => entry.filename.toLowerCase().endsWith('.xlsx')
       );
+
+      if (xlsxEntries.length !== groups.size) {
+        throw new Error(
+          `ZIP validation failed. Expected ${groups.size} Excel files, ` +
+          `but found ${xlsxEntries.length}.`
+        );
+      }
+    } finally {
+      await verifyReader.close();
     }
 
     if (reconciledRows !== rows) {
-      throw new Error(
-        'Transaction row reconciliation failed.'
-      );
+      throw new Error('Transaction row reconciliation failed.');
     }
 
-    await inputReader.close();
+    await reader.close();
 
     notify(
       'Completed',
@@ -623,10 +516,10 @@ async function run(file) {
     });
 
   } catch (error) {
-    try {
-      await inputReader.close();
-    } catch {}
-
+    for (const stream of openStreams) {
+      try { await stream.abort(); } catch {}
+    }
+    try { await reader.close(); } catch {}
     throw error;
   }
 }
@@ -637,10 +530,7 @@ self.onmessage = async event => {
   } catch (error) {
     self.postMessage({
       type: 'error',
-      message:
-        error?.stack ||
-        error?.message ||
-        String(error)
+      message: error?.stack || error?.message || String(error)
     });
   }
 };
