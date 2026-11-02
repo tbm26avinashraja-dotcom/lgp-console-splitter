@@ -5,50 +5,44 @@ import {
   BlobReader,
   TextReader,
   TextWriter,
+  BlobWriter,
   Writer
 } from '@zip.js/zip.js';
 
-// Adapter for zip.js 2.24.0.
-// The underlying OPFS stream is explicitly finalized after ZipWriter.close().
-class OPFSWriter extends Writer {
+class WritableStreamWriter extends Writer {
   constructor(stream) {
     super();
     this.writer = stream.getWriter();
-    this.finalized = false;
+    this.closed = false;
   }
 
-  async writeUint8Array(bytes) {
-    if (this.finalized) {
-      throw new Error('Cannot write after finalization.');
+  async writeUint8Array(array) {
+    if (this.closed) {
+      throw new Error('Cannot write to a closed stream.');
     }
-
-    await this.writer.write(bytes);
+    await this.writer.write(array);
   }
 
-  async finalize() {
-    if (this.finalized) return;
-
-    await this.writer.close();
-    this.finalized = true;
-    this.writer.releaseLock();
-  }
-
-  async abort() {
-    if (this.finalized) return;
+  async close() {
+    if (this.closed) return;
 
     try {
-      await this.writer.abort();
+      await this.writer.close();
+      this.closed = true;
     } finally {
-      this.finalized = true;
       this.writer.releaseLock();
     }
+  }
+
+  async getData() {
+    await this.close();
+    return undefined;
   }
 }
 
 const XML_HEAD =
   '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
-  '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">' +
-  '<sheetData>';
+  '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>';
 
 const XML_END = '</sheetData></worksheet>';
 
@@ -60,6 +54,7 @@ const STATIC = {
     '<Default Extension="xml" ContentType="application/xml"/>' +
     '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>' +
     '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>' +
+    '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>' +
     '</Types>',
 
   '_rels/.rels':
@@ -79,17 +74,18 @@ const STATIC = {
     '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
     '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
     '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>' +
+    '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>' +
     '</Relationships>'
 };
 
-function notify(label, detail, percent) {
+const notify = (label, detail, percent) => {
   self.postMessage({
     type: 'progress',
     label,
     detail,
     percent
   });
-}
+};
 
 function decodeXml(value) {
   return String(value ?? '')
@@ -144,6 +140,7 @@ function columnIndex(letters) {
 function cellParts(row) {
   const cells = [];
   const regex = /<c\b([^>]*?)(?:\s*\/>|>([\s\S]*?)<\/c\s*>)/g;
+
   let match;
 
   while ((match = regex.exec(row))) {
@@ -199,14 +196,23 @@ function cleanRow(row, rowNumber, sharedStrings) {
     const value = extractCell(cell, sharedStrings);
     const reference = `${cell.col}${rowNumber}`;
 
+    // Preserve original Excel style index.
+    // This retains date formatting.
+    const sourceStyle = /\bs="(\d+)"/.exec(cell.attrs)?.[1];
+
+    const styleAttr =
+      sourceStyle === undefined
+        ? ''
+        : ` s="${sourceStyle}"`;
+
     if (['s', 'inlineStr', 'str', 'e'].includes(type)) {
       xml +=
-        `<c r="${reference}" t="inlineStr">` +
+        `<c r="${reference}"${styleAttr} t="inlineStr">` +
         `<is><t xml:space="preserve">${escapeXml(value)}</t></is>` +
         '</c>';
     } else if (type === 'b') {
       xml +=
-        `<c r="${reference}" t="b">` +
+        `<c r="${reference}"${styleAttr} t="b">` +
         `<v>${value === '1' ? '1' : '0'}</v></c>`;
     } else if (value !== '') {
       if (!Number.isFinite(Number(value))) {
@@ -216,7 +222,8 @@ function cleanRow(row, rowNumber, sharedStrings) {
       }
 
       xml +=
-        `<c r="${reference}" t="n"><v>${value}</v></c>`;
+        `<c r="${reference}"${styleAttr} t="n">` +
+        `<v>${value}</v></c>`;
     }
   }
 
@@ -241,40 +248,6 @@ function parseSharedStrings(xml) {
   return values;
 }
 
-async function createZipInOPFS(dir, filename, entries, options = {}) {
-  const handle = await dir.getFileHandle(filename, {
-    create: true
-  });
-
-  const stream = await handle.createWritable();
-  const adapter = new OPFSWriter(stream);
-  const zip = new ZipWriter(adapter, options);
-
-  try {
-    for (const entry of entries) {
-      await zip.add(
-        entry.name,
-        entry.reader,
-        entry.options || {}
-      );
-    }
-
-    await zip.close();
-    await adapter.finalize();
-
-    const result = await handle.getFile();
-
-    if (result.size === 0) {
-      throw new Error(`${filename} was generated as an empty file.`);
-    }
-
-    return { handle, file: result };
-  } catch (error) {
-    await adapter.abort().catch(() => {});
-    throw error;
-  }
-}
-
 async function run(file) {
   if (!file) {
     throw new Error('Select an XLSX workbook.');
@@ -295,9 +268,26 @@ async function run(file) {
   });
 
   const reader = new ZipReader(new BlobReader(file));
+  const openStreams = new Set();
 
   try {
     const entries = await reader.getEntries();
+
+    // Read original Excel style definitions.
+    const sourceStyles = entries.find(
+      entry => entry.filename === 'xl/styles.xml'
+    );
+
+    if (!sourceStyles) {
+      throw new Error(
+        'Source workbook has no styles.xml. Date formatting cannot be preserved safely.'
+      );
+    }
+
+    // Load styles once and reuse for all party workbooks.
+    const stylesBlob = await sourceStyles.getData(
+      new BlobWriter()
+    );
 
     const sheet =
       entries.find(
@@ -326,7 +316,10 @@ async function run(file) {
         2
       );
 
-      const text = await sharedEntry.getData(new TextWriter());
+      const text = await sharedEntry.getData(
+        new TextWriter()
+      );
+
       sharedStrings = parseSharedStrings(text);
     }
 
@@ -347,7 +340,9 @@ async function run(file) {
       }
 
       let name = safeName(
-        key === '__UNASSIGNED__' ? 'UNASSIGNED' : key
+        key === '__UNASSIGNED__'
+          ? 'UNASSIGNED'
+          : key
       );
 
       const base = name;
@@ -365,6 +360,7 @@ async function run(file) {
       );
 
       const stream = await handle.createWritable();
+      openStreams.add(stream);
 
       await stream.write(XML_HEAD + headerXml);
 
@@ -405,7 +401,11 @@ async function run(file) {
           );
         }
 
-        headerXml = cleanRow(row, 1, sharedStrings);
+        headerXml = cleanRow(
+          row,
+          1,
+          sharedStrings
+        );
 
         return;
       }
@@ -517,14 +517,13 @@ async function run(file) {
       }
     }
 
-    // Keep the previously working streaming reader.
-    class InputWriter extends Writer {
-      async writeUint8Array(chunk) {
-        await parseChunk(chunk);
-      }
-    }
-
-    await sheet.getData(new InputWriter());
+    await sheet.getData(
+      new WritableStreamWriter(
+        new WritableStream({
+          write: parseChunk
+        })
+      )
+    );
 
     if (!headers || rows === 0) {
       throw new Error(
@@ -532,7 +531,7 @@ async function run(file) {
       );
     }
 
-    // Finalize each party's intermediate XML.
+    // Finish each party worksheet.
     for (const group of groups.values()) {
       if (group.buffer) {
         await group.stream.write(group.buffer);
@@ -540,6 +539,8 @@ async function run(file) {
 
       await group.stream.write(XML_END);
       await group.stream.close();
+
+      openStreams.delete(group.stream);
     }
 
     notify(
@@ -555,66 +556,101 @@ async function run(file) {
       { create: true }
     );
 
-    const outputStream = await outputHandle.createWritable();
-    const outputAdapter = new OPFSWriter(outputStream);
+    const outerStream =
+      await outputHandle.createWritable();
 
-    const outerZip = new ZipWriter(outputAdapter, {
-      level: 0
-    });
+    openStreams.add(outerStream);
+
+    const outerAdapter =
+      new WritableStreamWriter(outerStream);
+
+    const outerZip = new ZipWriter(
+      outerAdapter,
+      { level: 0 }
+    );
 
     let generated = 0;
     let reconciledRows = 0;
 
-    try {
-      for (const group of groups.values()) {
-        const workbookName =
-          `LGP_Console_${group.name}.xlsx`;
+    for (const group of groups.values()) {
+      const workbookHandle = await dir.getFileHandle(
+        `workbook_${generated}.xlsx`,
+        { create: true }
+      );
 
-        const workbookEntries = [
-          ...Object.entries(STATIC).map(([name, xml]) => ({
-            name,
-            reader: new TextReader(xml)
-          })),
-          {
-            name: 'xl/worksheets/sheet1.xml',
-            reader: new BlobReader(
-              await group.handle.getFile()
-            )
-          }
-        ];
+      const workbookStream =
+        await workbookHandle.createWritable();
 
-        const workbookResult = await createZipInOPFS(
-          dir,
-          `workbook_${generated}.xlsx`,
-          workbookEntries
-        );
+      openStreams.add(workbookStream);
 
-        await outerZip.add(
-          workbookName,
-          new BlobReader(workbookResult.file),
-          { level: 0 }
-        );
+      const workbookAdapter =
+        new WritableStreamWriter(workbookStream);
 
-        reconciledRows += group.rows;
-        generated++;
+      const workbookZip =
+        new ZipWriter(workbookAdapter);
 
-        notify(
-          'Generating workbooks',
-          `Created ${generated} of ${groups.size}`,
-          67 + Math.round(
-            generated / groups.size * 32
-          )
+      // Write the XLSX package components.
+      for (const [name, xml] of Object.entries(STATIC)) {
+        await workbookZip.add(
+          name,
+          new TextReader(xml)
         );
       }
 
-      await outerZip.close();
-      await outputAdapter.finalize();
-    } catch (error) {
-      await outputAdapter.abort().catch(() => {});
-      throw error;
+      // Include original Excel style definitions.
+      await workbookZip.add(
+        'xl/styles.xml',
+        new BlobReader(stylesBlob)
+      );
+
+      // Include this party's worksheet data.
+      await workbookZip.add(
+        'xl/worksheets/sheet1.xml',
+        new BlobReader(
+          await group.handle.getFile()
+        )
+      );
+
+      await workbookZip.close();
+      await workbookAdapter.close();
+
+      openStreams.delete(workbookStream);
+
+      const workbookFile =
+        await workbookHandle.getFile();
+
+      if (workbookFile.size === 0) {
+        throw new Error(
+          `Generated workbook ${group.name} is empty.`
+        );
+      }
+
+      await outerZip.add(
+        `LGP_Console_${group.name}.xlsx`,
+        new BlobReader(workbookFile),
+        { level: 0 }
+      );
+
+      reconciledRows += group.rows;
+      generated++;
+
+      notify(
+        'Generating workbooks',
+        `Created ${generated} of ${groups.size}`,
+        67 + Math.round(
+          generated / groups.size * 32
+        )
+      );
     }
 
-    const finalZipFile = await outputHandle.getFile();
+    await outerZip.close();
+    await outerAdapter.close();
+
+    openStreams.delete(outerStream);
+
+    // Validate final ZIP.
+    const finalZipFile =
+      await outputHandle.getFile();
 
     if (finalZipFile.size === 0) {
       throw new Error(
@@ -644,7 +680,7 @@ async function run(file) {
       for (const entry of xlsxEntries) {
         if (!entry.uncompressedSize) {
           throw new Error(
-            `ZIP contains an empty workbook: ${entry.filename}`
+            `ZIP entry is empty: ${entry.filename}`
           );
         }
       }
@@ -676,6 +712,12 @@ async function run(file) {
     });
 
   } catch (error) {
+    for (const stream of openStreams) {
+      try {
+        await stream.abort();
+      } catch {}
+    }
+
     try {
       await reader.close();
     } catch {}
